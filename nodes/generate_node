@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Usage: ./generate_node <node-name> [server|client]
+# Example: ./generate_node camera-042 client
+#          ./generate_node video-server server
+#
+# The CA lives in the repo's ca/ folder and is never passed in or moved.
+# Stops if that folder has no usable CA material. Writes ./<node-name>/ next
+# to this script — a folder you can copy onto the device. That folder keeps
+# only what the node itself stores:
+#   node.key  this node's private key
+#   node.crt  this node's certificate
+#   ca.crt    CA certificate, so the node can verify peers
+# The CA private key stays in ca/ and is never copied.
+
+if [[ $# -lt 1 ]]; then
+  echo "Usage: $0 <node-name> [server|client]" >&2
+  echo "  node-name : identifier for the node (used as CN and folder name)" >&2
+  echo "  type      : 'server' or 'client' (default: client)" >&2
+  exit 1
+fi
+
+NODE_NAME="$1"
+NODE_TYPE="${2:-client}"
+DAYS=825   # ~2 years (common for end-entity certs)
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Repo layout is fixed: this script is nodes/generate_node, the CA is ../ca.
+CA_DIR="$SCRIPT_DIR/../ca"
+
+if [[ ! "$NODE_NAME" =~ ^[A-Za-z0-9._-]+$ || "$NODE_NAME" == "." || "$NODE_NAME" == ".." ]]; then
+  echo "Error: node-name must contain only letters, numbers, '.', '_' or '-'" >&2
+  exit 1
+fi
+
+case "$NODE_TYPE" in
+  server) EKU="serverAuth" ;;
+  client) EKU="clientAuth" ;;
+  *)
+    echo "Error: type must be 'server' or 'client'" >&2
+    exit 1
+    ;;
+esac
+
+if [[ ! -d "$CA_DIR" ]]; then
+  echo "Error: no CA values to use; folder not found: $CA_DIR" >&2
+  exit 1
+fi
+
+CA_DIR="$(cd "$CA_DIR" && pwd)"
+CA_KEY="$CA_DIR/ca.key"
+CA_CRT="$CA_DIR/ca.crt"
+
+missing=()
+[[ -s "$CA_KEY" ]] || missing+=("ca.key")
+[[ -s "$CA_CRT" ]] || missing+=("ca.crt")
+if ((${#missing[@]})); then
+  echo "Error: no CA values to use in $CA_DIR" >&2
+  echo "  Missing or empty: ${missing[*]}" >&2
+  echo "Stopping. No node folder was created." >&2
+  exit 1
+fi
+
+if ! cert_mod="$(openssl x509 -in "$CA_CRT" -noout -modulus 2>/dev/null)"; then
+  echo "Error: ca.crt in $CA_DIR is not a usable certificate" >&2
+  echo "Stopping. No node folder was created." >&2
+  exit 1
+fi
+
+if ! key_mod="$(openssl rsa -in "$CA_KEY" -noout -modulus 2>/dev/null)"; then
+  echo "Error: ca.key in $CA_DIR is not a usable RSA private key" >&2
+  echo "Stopping. No node folder was created." >&2
+  exit 1
+fi
+
+if [[ "$cert_mod" != "$key_mod" ]]; then
+  echo "Error: ca.key does not match ca.crt in $CA_DIR" >&2
+  echo "Stopping. No node folder was created." >&2
+  exit 1
+fi
+
+NODE_DIR="$SCRIPT_DIR/$NODE_NAME"
+
+if [[ -e "$NODE_DIR" ]]; then
+  echo "Error: '$NODE_DIR' already exists" >&2
+  echo "Remove or rename it if you want to regenerate this node." >&2
+  exit 1
+fi
+
+WORK="$(mktemp -d)"
+cleanup() {
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+NODE_KEY="$WORK/node.key"
+NODE_CSR="$WORK/node.csr"
+NODE_CRT="$WORK/node.crt"
+
+echo "Generating private key for $NODE_NAME..."
+openssl genrsa -out "$NODE_KEY" 2048
+chmod 600 "$NODE_KEY"
+
+echo "Creating certificate signing request..."
+openssl req -new \
+  -key "$NODE_KEY" \
+  -out "$NODE_CSR" \
+  -subj "/CN=$NODE_NAME"
+
+echo "Signing certificate with CA..."
+openssl x509 -req \
+  -in "$NODE_CSR" \
+  -CA "$CA_CRT" \
+  -CAkey "$CA_KEY" \
+  -CAcreateserial \
+  -out "$NODE_CRT" \
+  -days "$DAYS" \
+  -extfile <(printf "basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=$EKU\n")
+
+# Publish only the files the node keeps. The CSR and the CA key stay out.
+if ! {
+  mkdir "$NODE_DIR"
+  cp "$NODE_KEY" "$NODE_DIR/node.key"
+  cp "$NODE_CRT" "$NODE_DIR/node.crt"
+  cp "$CA_CRT" "$NODE_DIR/ca.crt"
+  chmod 600 "$NODE_DIR/node.key"
+  chmod 644 "$NODE_DIR/node.crt" "$NODE_DIR/ca.crt"
+}; then
+  rm -rf "$NODE_DIR"
+  echo "Error: failed to create $NODE_DIR" >&2
+  exit 1
+fi
+
+echo
+echo "Done."
+echo "  Node folder : $NODE_DIR"
+echo "  Private key : $NODE_DIR/node.key"
+echo "  Certificate : $NODE_DIR/node.crt"
+echo "  CA cert     : $NODE_DIR/ca.crt"
+echo "  Type        : $NODE_TYPE ($EKU)"
+echo
+echo "Copy '$NODE_DIR' onto the node. It contains only what that node keeps."
