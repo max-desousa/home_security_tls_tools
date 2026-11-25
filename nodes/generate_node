@@ -9,10 +9,15 @@ set -euo pipefail
 # Stops if that folder has no usable CA material. Writes ./<node-name>/ next
 # to this script — a folder you can copy onto the device. That folder keeps
 # only what the node itself stores:
-#   node.key  this node's private key
+#   node.key  this node's private key, PKCS#8 PEM (BEGIN PRIVATE KEY)
 #   node.crt  this node's certificate
 #   ca.crt    CA certificate, so the node can verify peers
 # The CA private key stays in ca/ and is never copied.
+# node.key is PKCS#8 (BEGIN PRIVATE KEY) because that is the private-key
+# file tls.zig can load. tls.zig rejects the older PKCS#1 label
+# (BEGIN RSA PRIVATE KEY). The certificate files are already in the form
+# tls.zig reads. genpkey is used so the label does not depend on which
+# OpenSSL version happens to be installed.
 
 if [[ $# -lt 1 ]]; then
   echo "Usage: $0 <node-name> [server|client]" >&2
@@ -99,8 +104,14 @@ NODE_CSR="$WORK/node.csr"
 NODE_CRT="$WORK/node.crt"
 
 echo "Generating private key for $NODE_NAME..."
-openssl genrsa -out "$NODE_KEY" 2048
+# genpkey writes PKCS#8 (BEGIN PRIVATE KEY), which tls.zig can load.
+# The older label, BEGIN RSA PRIVATE KEY, is rejected by tls.zig.
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$NODE_KEY"
 chmod 600 "$NODE_KEY"
+if ! grep -q -- "-----BEGIN PRIVATE KEY-----" "$NODE_KEY"; then
+  echo "Error: node.key is not a PKCS#8 private key (expected BEGIN PRIVATE KEY)" >&2
+  exit 1
+fi
 
 echo "Creating certificate signing request..."
 openssl req -new \
